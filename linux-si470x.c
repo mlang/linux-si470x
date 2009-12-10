@@ -1288,15 +1288,21 @@ main(int argc, char *argv[]) {
 	  //kill(-cpid, SIGTERM);
 	}
       } else {
-	printf("Not a radio device\n");
+	printf("%s is not a FM radio\n", device);
       }
     } else {
-      perror("ioctl");
+      perror("ioctl VIDIOC_G_TUNER");
     }
 
     close(fd);
   } else {
-    perror("open");
+    switch (errno) {
+    case ENOENT:
+      printf("Device %s does not exist\n", device);
+      break;
+    default:
+      perror("open");
+    }
   }
 
   return 1;
