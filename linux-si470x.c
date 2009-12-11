@@ -85,7 +85,7 @@ getTunerFrequency(int fd) {
   freq.tuner = 0;
   freq.type = V4L2_TUNER_RADIO;
   if (ioctl(fd, VIDIOC_G_FREQUENCY, &freq) != -1) {
-    return freq.frequency / frequencyDivider;
+    return freq.frequency / (float)frequencyDivider;
   } else {
     perror("ioctl VIDIOC_G_FREQUENCY");
   }
@@ -190,18 +190,21 @@ nextProgram(int fd, struct v4l2_tuner *tuner) {
 
   if (programCount <= 1) return;
   for (i = 0; i < programCount; i++) {
-    if (currentFrequency >= programs[i].freq-.04
-     && currentFrequency <= programs[i].freq+.04) {
-      int next = (i == programCount - 1)? 0 : i+1;
+    if (currentFrequency >= programs[i].freq-.09
+     && currentFrequency <= programs[i].freq+.09) {
+      int next = (i == programCount - 1)? 0 : i + 1;
       while (next != i) {
         float freq = programs[next].freq;
         if (freq >= minFrequency) {
+          if (programs[next].name[0])
+            printf("Switching to %s (%.2f)\n", programs[next].name, freq);
           setTunerFrequency(fd, tuner, freq);
           currentFrequency = freq;
           return;
         }
         if (next == programCount - 1) next = 0; else next += 1;
       }
+      printf("No other stations known\n");
       return;
     }
   }
