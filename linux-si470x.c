@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -112,7 +113,7 @@ seekTunerFrequency(int fd, int up) {
 
 /* Radio (Broadcast) Data System */
 
-static char *programTypes[30] = {
+static const char *programTypes[30] = {
   "News", "Current affairs", "Information", "Sport",
   "Education", "Drama", "Culture", "Science", "Varied", "Pop music",
   "Rock music", "Easy listening", "Light classical", "Serious classical",
@@ -247,7 +248,6 @@ decodeRds(int fd, struct v4l2_tuner *tuner) {
   int errorCount = 0;
 
   RDS_GroupType groupType;
-  int lastPtyCode = 0;
   unsigned char groupData[2*4];
   unsigned char lastGroupData[2*4];
 
@@ -268,48 +268,65 @@ decodeRds(int fd, struct v4l2_tuner *tuner) {
   memset(radioText, ' ', 4*0X10);
   radioText[4*0X10] = 0;
 
-  fcntl(0, F_SETFL, fcntl(0, F_GETFL)|O_NONBLOCK);
-  disableCannonicalMode();
+  if (isatty(STDIN_FILENO)) {
+    disableCannonicalMode();
+  }
   while (1) {
-    count = read(fd, &rdsData, sizeof(rdsData));
+    struct pollfd fds[] = {
+      { .fd = fd, .events = POLLIN },
+      { .fd = STDIN_FILENO, .events = POLLIN }
+    };
+    const int fdCount = sizeof(fds)/sizeof(*fds);
+    int pollval = poll(fds, fdCount, 1000);
 
-    if (count == -1) {
-      if (errno == EAGAIN) {
-	uint8_t c;
-	count = read(0, &c, 1);
-	if (count == 1) {
-	  switch (c) {
-          case 'n': nextProgram(fd, tuner); break;
-	  case '+': {
-	    currentFrequency += .05;
-	    if (currentFrequency > maxFrequency)
-	      currentFrequency = minFrequency;
-	    setTunerFrequency(fd, tuner, currentFrequency);
-	    printf("Frequency tuned to %.2f\n", currentFrequency);
-	    break;
-	  }
-	  case '-': {
-	    currentFrequency -= .05;
-	    if (currentFrequency < minFrequency)
-	      currentFrequency = maxFrequency;
-	    setTunerFrequency(fd, tuner, currentFrequency);
-	    printf("Frequency tuned to %.2f\n", currentFrequency);
-	    break;
-	  }
-	  default:
-	    printf("Keyboard: %d (%X)\n", c, c);
-	  }
-          continue;
-	} else if (count == 0) {
-	  break;
-	}
-        usleep(10000);
-	continue;
+    if (pollval == 0) {
+      if (verbose) printf("No RDS data\n");
+      continue;
+    } else if (pollval == -1) {
+      perror("poll");
+      break;
+    }
+    
+    for (int i = 0; i < fdCount; i++) {
+      if (fds[i].revents & fds[i].events) {
+        if (fds[i].fd == fd) {
+          count = read(fd, &rdsData, sizeof(rdsData));
+          if (count == 0) break;
+          if (count != sizeof(rdsData)) {
+            printf("ERR: Incomplete RDS block, count was %d\n", (int)count);
+            continue;
+          }
+        } else if (fds[i].fd == STDIN_FILENO) {
+          uint8_t c;
+          count = read(STDIN_FILENO, &c, 1);
+          if (count == 1) {
+            switch (c) {
+            case 'n': nextProgram(fd, tuner); break;
+            case '+': {
+              currentFrequency += .05;
+              if (currentFrequency > maxFrequency)
+                currentFrequency = minFrequency;
+              setTunerFrequency(fd, tuner, currentFrequency);
+              printf("Frequency tuned to %.2f\n", currentFrequency);
+              break;
+            }
+            case '-': {
+              currentFrequency -= .05;
+              if (currentFrequency < minFrequency)
+                currentFrequency = maxFrequency;
+              setTunerFrequency(fd, tuner, currentFrequency);
+              printf("Frequency tuned to %.2f\n", currentFrequency);
+              break;
+            }
+            default:
+              printf("Keyboard: %d (%X)\n", c, c);
+            }
+            continue;
+          } else if (count == 0) {
+            break;
+          }
+        }
       }
-      perror("rds read");
-      break;
-    } else if (count == 0) {
-      break;
     }
 
     int blockNumber = rdsData.block & 0X07;
@@ -323,7 +340,7 @@ decodeRds(int fd, struct v4l2_tuner *tuner) {
 			  errorCount, blockCount);
       continue;
     }
-    //printf("%02X %02X%02X\n", rdsData.block, rdsData.msb, rdsData.lsb);
+
     if (blockNumber == 0) {
       thisProgram = getProgram(rdsData.msb<<8|rdsData.lsb);
       thisProgram->freq = currentFrequency;
@@ -331,11 +348,12 @@ decodeRds(int fd, struct v4l2_tuner *tuner) {
     if (blockNumber == 1) {
       int ptyCode = ((rdsData.msb << 3) & 0X18) | ((rdsData.lsb >> 5) & 0X07);
 
-      if (thisProgram != NULL && ptyCode != 0)
-	thisProgram->type = ptyCode;
-      if (ptyCode != lastPtyCode) {
-	lastPtyCode = ptyCode;
-	if (ptyCode > 0) printf("Program type: %s\n", programTypes[ptyCode-1]);
+      if (thisProgram != NULL && ptyCode != 0) {
+	if (thisProgram->type != ptyCode) {
+          thisProgram->type = ptyCode;
+          if (ptyCode > 0) printf("Program type: %s\n",
+                                  programTypes[ptyCode-1]);
+        }
       }
       groupType = (RDS_GroupType)rdsData.msb>>3;
     }
@@ -590,11 +608,11 @@ decodeRds(int fd, struct v4l2_tuner *tuner) {
 
 static snd_pcm_t *alsa_handle;
 
-static int sample_rate = 96000;
+static unsigned int inputSampleRate = 96000;
 static char num_channels = 2;
-static int period_size = 2048, num_periods = 4;
+static unsigned int period_size = 2048, num_periods = 4; /* 85ms */
 
-static int resample_quality = 3;
+static unsigned int resample_quality = 3;
 
 #ifdef HAVE_JACK
 #include <alloca.h>
@@ -602,11 +620,11 @@ static int resample_quality = 3;
 
 #include <jack/jack.h>
 
-static jack_client_t *client;
-static jack_port_t *capture_ports[MAX_CHANNELS];
-static SRC_STATE *capture_srcs[MAX_CHANNELS];
+static jack_client_t *jackClient;
+static jack_port_t *jackPorts[MAX_CHANNELS];
+static SRC_STATE *srcs[MAX_CHANNELS];
 
-static int jack_sample_rate, jack_buffer_size;
+static int jackSampleRate, jackBufferSize;
 
 static int quit = 0;
 static double resample_mean = 1.0;
@@ -718,12 +736,10 @@ set_hwparams(snd_pcm_t *handle, snd_pcm_hw_params_t *params,
 	    if (rrate != rate) {
 	      printf("WARNING: Rate doesn't match (requested %iHz, get %iHz)\n", rate,
 		     rrate);
-	      sample_rate = rrate;
+	      inputSampleRate = rrate;
 	    }
-            uint64_t tmp;
-	    tmp = 1000000U*(uint64_t)period*(uint64_t)nperiods/(uint64_t)rrate;
-            printf("buffer_time = %d\n", (int)tmp);
-            buffer_time = tmp;
+	    buffer_time = 1000000*(uint64_t)period*nperiods/rrate;
+            printf("buffer_time = %d\n", buffer_time);
 	    if ((err = snd_pcm_hw_params_set_buffer_time_near(handle, params,
 							      &buffer_time,
 							      &dir)) >= 0) {
@@ -738,7 +754,7 @@ set_hwparams(snd_pcm_t *handle, snd_pcm_hw_params_t *params,
 			 nperiods * period, (int) real_buffer_size);
 		}
 		/* set the period time */
-		printf("period_time = %d\n", period_time = 1000000U*period/rrate);
+		printf("period_time = %d\n", period_time = 1000000U*(uint64_t)period/rrate);
 		if ((err = snd_pcm_hw_params_set_period_time_near(handle,
 								  params,
 								  &period_time,
@@ -756,18 +772,23 @@ set_hwparams(snd_pcm_t *handle, snd_pcm_hw_params_t *params,
 		    }
 
 		    /* write the parameters to device */
-		    if ((err = snd_pcm_hw_params(handle, params)) >= 0) {
+		    if ((err = snd_pcm_hw_params(handle, params)) == 0) {
+                      if (verbose)
+                        printf("Input buffer time: %.1fms\n",
+                               1000.0/(rrate/(float)real_buffer_size));
 		      return 0;
 		    } else {
 		      printf("Unable to set hw params for capture: %s\n",
 			     snd_strerror(err));
 		    }
 		  } else {
-		    printf("Unable to get period size back: %s\n", snd_strerror(err));
+		    printf("Unable to get period size back: %s\n",
+                           snd_strerror(err));
 		  }
 		} else {
 		  printf("Unable to set period time %i for capture: %s\n",
-			 1000000*period/rate, snd_strerror(err));
+			 (int)(1000000*(uint64_t)period/rate),
+                         snd_strerror(err));
 		}
 	      } else {
 		printf("Unable to get buffer size back: %s\n",
@@ -775,7 +796,8 @@ set_hwparams(snd_pcm_t *handle, snd_pcm_hw_params_t *params,
 	      }
 	    } else {
 	      printf("Unable to set buffer time %i for capture: %s\n",
-		     1000000*period*nperiods/rate, snd_strerror(err));
+		     (int)(1000000*(uint64_t)period*nperiods/rate),
+                     snd_strerror(err));
 	    }
 	  } else {
 	    printf("Rate %iHz not available for playback: %s\n",
@@ -873,13 +895,12 @@ openAudioIn(char *device, int rate, int channels, int period, int nperiods) {
 #define MIN_RESAMPLE_FACTOR 0.25
 #define MAX_RESAMPLE_FACTOR 4.0
 
-static int
-process(jack_nframes_t nframes, void *arg) {
+static int process(jack_nframes_t nframes, void *arg) {
   int err;
   snd_pcm_sframes_t delay = snd_pcm_avail(alsa_handle);
   int i;
 
-  delay -= jack_frames_since_cycle_start(client);
+  delay -= jack_frames_since_cycle_start(jackClient);
   if (delay > (target_delay+max_diff)) {
     const int skipFrames = delay-target_delay;
     char tmp[skipFrames * formats[format].sample_size * num_channels]; 
@@ -911,7 +932,7 @@ process(jack_nframes_t nframes, void *arg) {
     printf("Rewound %d, delay was %d\n", rewound, (int)delay);
 
     output_new_delay = (int)delay;
-    delay = target_delay;
+    delay += rewound;
 
     // Set the resample_rate... we need to adjust the offset integral, to do this.
     offset_integral = - (resample_mean - static_resample_factor)
@@ -1004,8 +1025,8 @@ process(jack_nframes_t nframes, void *arg) {
     SRC_DATA src;
     int unusedFrames = 0;
     for (channel = 0; channel < num_channels; channel++) {
-      float *buf = jack_port_get_buffer(capture_ports[channel], nframes);
-      SRC_STATE *src_state = capture_srcs[channel];
+      float *buf = jack_port_get_buffer(jackPorts[channel], nframes);
+      SRC_STATE *src_state = srcs[channel];
 
       formats[format].soundcard_to_jack(resampbuf,
 					outbuf + format[formats].sample_size
@@ -1040,25 +1061,22 @@ process(jack_nframes_t nframes, void *arg) {
  */
 static void
 alloc_ports(int n_capture) {
-    int port_flags = JackPortIsOutput;
-    int chn;
-    jack_port_t *port;
+  for (int chn = 0; chn < n_capture; chn++) {
     char buf[32];
+    snprintf(buf, sizeof(buf) - 1, "capture_%u", chn+1);
 
-    for (chn = 0; chn < n_capture; chn++) {
-	snprintf (buf, sizeof(buf) - 1, "capture_%u", chn+1);
+    jack_port_t *port = jack_port_register(jackClient, buf,
+					   JACK_DEFAULT_AUDIO_TYPE,
+                                           JackPortIsOutput, 0);
 
-	port = jack_port_register(client, buf, JACK_DEFAULT_AUDIO_TYPE,
-				  port_flags, 0);
-
-	if (!port) {
-	    printf("cannot register port for %s", buf);
-	    break;
-	}
-
-	capture_srcs[chn] = src_new(4-resample_quality, 1, NULL);
-	capture_ports[chn] = port;
+    if (port == NULL) {
+      printf("cannot register port %s\n", buf);
+      exit(EXIT_FAILURE);
     }
+
+    srcs[chn] = src_new(4-resample_quality, 1, NULL);
+    jackPorts[chn] = port;
+  }
 }
 
 static void
@@ -1084,10 +1102,10 @@ setupSmoothing() {
 
       return 1;
     } else {
-      fprintf(stderr, "no memory for window_array !!!\n");
+      fprintf(stderr, "no memory for window_array\n");
     }
   } else {
-    fprintf(stderr, "no memory for offset_array !!!\n" );
+    fprintf(stderr, "no memory for offset_array\n");
   }
   return 0;
 }
@@ -1142,7 +1160,7 @@ main(int argc, char *argv[]) {
     }
   }
 
-  if ((fd = open(device, O_RDONLY|O_NONBLOCK)) > 0) {
+  if ((fd = open(device, O_RDONLY)) > 0) {
     struct v4l2_tuner tuner;
 
     memset(&tuner, 0, sizeof(tuner));
@@ -1199,43 +1217,46 @@ main(int argc, char *argv[]) {
 	  } else {
 	    if (useJack) {
 #ifdef HAVE_JACK
-	      char *jack_name = "si470x";
+	      const char *jack_name = "si470x";
 
 	      if (setupSmoothing()) {
 		if ((alsa_handle = openAudioIn(alsaDevice,
-						sample_rate, num_channels,
+						inputSampleRate, num_channels,
 						period_size, num_periods))
 		    != NULL) {
-		  if ((client = jack_client_open(jack_name, 0, NULL)) != NULL) {
-		    jack_set_process_callback(client, process, 0);
-		    jack_on_shutdown(client, jack_shutdown, 0);
-		    jack_sample_rate = jack_get_sample_rate(client);
+		  if ((jackClient = jack_client_open(jack_name, 0, NULL)) 
+		      != NULL) {
+		    jack_set_process_callback(jackClient, process, 0);
+		    jack_on_shutdown(jackClient, jack_shutdown, 0);
+		    jackSampleRate = jack_get_sample_rate(jackClient);
 
-		    static_resample_factor = (double)jack_sample_rate
-		                           / (double)sample_rate;
+		    static_resample_factor = (double)jackSampleRate
+		                           / (double)inputSampleRate;
 		    resample_mean = static_resample_factor;
       
-		    jack_buffer_size = jack_get_buffer_size(client);
+		    jackBufferSize = jack_get_buffer_size(jackClient);
 		    if (!target_delay)
 		      target_delay = (num_periods*period_size / 2)
-			           + jack_buffer_size/2;
+			           + jackBufferSize/2;
 		    if (!max_diff)
 		      max_diff = num_periods*period_size - target_delay;	
       
-                    printf("target_delay=%d\nmax_diff=%d\n", target_delay, max_diff);
+                    if (verbose > 1)
+                      printf("target_delay=%d\nmax_diff=%d\n",
+                             target_delay, max_diff);
 		    alloc_ports(num_channels);
 
-		    if (jack_activate(client) == 0) {
+		    if (jack_activate(jackClient) == 0) {
 		      signal(SIGTERM, sigterm_handler);
 		      signal(SIGINT, sigterm_handler);
 
 		      int i;
-		      const char **port = jack_get_ports(client, NULL, NULL,
+		      const char **port = jack_get_ports(jackClient, NULL, NULL,
 							 JackPortIsInput);
 		      for (i = 0; i < num_channels && *port; i++) {
 			if (*port[0]) {
-			  jack_connect(client,
-				       jack_port_name(capture_ports[i]),
+			  jack_connect(jackClient,
+				       jack_port_name(jackPorts[i]),
 				       *port);
 			  port++;
 			}
@@ -1244,20 +1265,20 @@ main(int argc, char *argv[]) {
 			usleep(250000);
 			if (verbose > 0 && output_new_delay > 0) {
 			  printf("delay = %d\n", output_new_delay);
-			  output_new_delay = 0;
-			}
-			if (verbose > 1)
+                          output_new_delay = 0;
+                        }
+                        if (verbose > 1)
 			  printf("srcfactor: %f, diff = %f, offset = %f, integral=%f\n",
 				 output_resampling_factor, output_diff,
                                  output_offset, output_integral);
 		      }
 
-		      jack_deactivate(client);
+                      jack_deactivate(jackClient);
 		    } else {
 		      fprintf(stderr, "cannot activate JACK client\n");
 		    }
-		    jack_client_close(client);
-		    src_delete(capture_srcs[0]); src_delete(capture_srcs[1]);
+		    jack_client_close(jackClient);
+		    src_delete(srcs[0]); src_delete(srcs[1]);
 
 		    exit(0);
 		  } else {
