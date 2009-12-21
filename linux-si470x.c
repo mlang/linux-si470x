@@ -606,7 +606,7 @@ decodeRds(int fd, struct v4l2_tuner *tuner) {
 #include <alsa/asoundlib.h>
 #include <samplerate.h>
 
-static snd_pcm_t *alsa_handle;
+static snd_pcm_t *pcmIn;
 
 static unsigned int inputSampleRate = 96000;
 static char num_channels = 2;
@@ -897,7 +897,7 @@ openAudioIn(char *device, int rate, int channels, int period, int nperiods) {
 
 static int process(jack_nframes_t nframes, void *arg) {
   int err;
-  snd_pcm_sframes_t delay = snd_pcm_avail(alsa_handle);
+  snd_pcm_sframes_t delay = snd_pcm_avail(pcmIn);
   int i;
 
   delay -= jack_frames_since_cycle_start(jackClient);
@@ -907,10 +907,10 @@ static int process(jack_nframes_t nframes, void *arg) {
     printf("Skipping %d frames\n", skipFrames);
     int count = skipFrames;
     while (count > 0) {
-      int amount = snd_pcm_readi(alsa_handle, tmp, skipFrames);
+      int amount = snd_pcm_readi(pcmIn, tmp, skipFrames);
       if (amount == -EAGAIN) continue;
       if (amount < 0) {
-	xrun_recovery(alsa_handle, amount);
+	xrun_recovery(pcmIn, amount);
 	continue;
       }
       count -= amount;
@@ -928,7 +928,7 @@ static int process(jack_nframes_t nframes, void *arg) {
     for (i=0; i<smooth_size; i++) offset_array[i] = 0.0;
   }
   if (delay < (target_delay-max_diff)) {
-    int rewound = snd_pcm_rewind(alsa_handle, target_delay - delay);
+    int rewound = snd_pcm_rewind(pcmIn, target_delay - delay);
     printf("Rewound %d, delay was %d\n", rewound, (int)delay);
 
     output_new_delay = (int)delay;
@@ -1008,10 +1008,10 @@ static int process(jack_nframes_t nframes, void *arg) {
     // get the data...
     int iterations = 10;
     while (framesToRead > 0 && --iterations) {
-      err = snd_pcm_readi(alsa_handle, outbuf+readOffset, framesToRead);
+      err = snd_pcm_readi(pcmIn, outbuf+readOffset, framesToRead);
       if (err == -EAGAIN) { usleep(100); continue; }
       if (err < 0) {
-	if (xrun_recovery(alsa_handle, err) < 0) {
+	if (xrun_recovery(pcmIn, err) < 0) {
 	  printf("xrun_recover failed: %s\n", snd_strerror(err));
 	  exit(EXIT_FAILURE);
 	}
@@ -1049,7 +1049,7 @@ static int process(jack_nframes_t nframes, void *arg) {
 
     if (unusedFrames) {
       if (verbose > 1) printf("putback = %d\n", unusedFrames);
-      snd_pcm_rewind(alsa_handle, unusedFrames);
+      snd_pcm_rewind(pcmIn, unusedFrames);
     }
   }
 
@@ -1220,11 +1220,10 @@ main(int argc, char *argv[]) {
 	      const char *jack_name = "si470x";
 
 	      if (setupSmoothing()) {
-		if ((alsa_handle = openAudioIn(alsaDevice,
-						inputSampleRate, num_channels,
-						period_size, num_periods))
-		    != NULL) {
-		  if ((jackClient = jack_client_open(jack_name, 0, NULL)) 
+		if ((pcmIn = openAudioIn(alsaDevice,
+					 inputSampleRate, num_channels,
+					 period_size, num_periods)) != NULL) {
+		  if ((jackClient = jack_client_open(jack_name, JackNullOption, NULL)) 
 		      != NULL) {
 		    jack_set_process_callback(jackClient, process, 0);
 		    jack_on_shutdown(jackClient, jack_shutdown, 0);
@@ -1279,15 +1278,16 @@ main(int argc, char *argv[]) {
 		    }
 		    jack_client_close(jackClient);
 		    src_delete(srcs[0]); src_delete(srcs[1]);
-
-		    exit(0);
 		  } else {
 		    fprintf (stderr, "jack server not running?\n");
 		  }
+
+		  snd_pcm_close(pcmIn);
+		  exit(EXIT_SUCCESS);
 		}
 	      }
 
-	      exit(1);
+	      exit(EXIT_FAILURE);
 #else
 	      printf("Jack support not compiled in\n");
 #endif
